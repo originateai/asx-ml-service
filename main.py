@@ -1,7 +1,7 @@
 """
-ASX Layer 7 ML Microservice
-FastAPI service that loads the XGBoost model and returns buy probability
-Deploy on Railway: https://railway.app
+ASX Layer 7 ML Microservice v2
+FastAPI service — retrained with correct Wilder's RSI and adjusted_close prices
+Feature order matches retrain_ml.py exactly
 """
 
 from fastapi import FastAPI, HTTPException
@@ -9,9 +9,8 @@ from pydantic import BaseModel
 import numpy as np
 import os
 
-app = FastAPI(title="ASX Layer 7 ML", version="1.0")
+app = FastAPI(title="ASX Layer 7 ML v2", version="2.0")
 
-# Load model on startup
 model = None
 
 @app.on_event("startup")
@@ -19,14 +18,28 @@ def load_model():
     global model
     try:
         import joblib
-        model_path = os.path.join(os.path.dirname(__file__), 'asx_layer7_model.joblib')
-        model = joblib.load(model_path)
-        print(f"Model loaded: {type(model).__name__}")
+        # Try v2 model first, fall back to v1
+        for name in ['asx_layer7_model_v2.joblib', 'asx_layer7_model.joblib']:
+            path = os.path.join(os.path.dirname(__file__), name)
+            if os.path.exists(path):
+                model = joblib.load(path)
+                print(f"Model loaded: {name} ({type(model).__name__})")
+                return
+        print("No model file found")
     except Exception as e:
         print(f"Model load failed: {e}")
 
+# Feature order must match retrain_ml.py exactly
+FEATURE_COLS = [
+    'rsi14', 'sma20', 'sma50', 'sma200', 'bb_pos',
+    'vol_ratio', 'roc5', 'roc20',
+    'pct_from_sma20', 'pct_from_sma200',
+    'above_sma20', 'above_sma200', 'golden_cross',
+    'hammer', 'bull_candle', 'lower_shadow', 'upper_shadow',
+    'body', 'range'
+]
+
 class StockFeatures(BaseModel):
-    # Top features from backtest (in order model was trained)
     rsi14:            float = 50.0
     sma20:            float = 0.0
     sma50:            float = 0.0
@@ -47,82 +60,39 @@ class StockFeatures(BaseModel):
     body:             float = 0.0
     range:            float = 0.0
 
-class PredictionResponse(BaseModel):
-    ticker:      str
-    probability: float
-    signal:      str
-    confidence:  str
-
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": model is not None}
+    return {"status": "ok", "model_loaded": model is not None, "version": "2.0"}
 
-@app.post("/predict/{ticker}", response_model=PredictionResponse)
+@app.post("/predict/{ticker}")
 def predict(ticker: str, features: StockFeatures):
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-
-    # Feature order must match training order
-    feature_cols = [
-        'rsi14', 'sma20', 'sma50', 'sma200', 'bb_pos',
-        'vol_ratio', 'roc5', 'roc20',
-        'pct_from_sma20', 'pct_from_sma200',
-        'above_sma20', 'above_sma200', 'golden_cross',
-        'hammer', 'bull_candle', 'lower_shadow', 'upper_shadow',
-        'body', 'range'
-    ]
-
-    X = np.array([[getattr(features, f) for f in feature_cols]])
-
+    X = np.array([[getattr(features, f) for f in FEATURE_COLS]])
     try:
         proba = float(model.predict_proba(X)[0][1])
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction error: {e}")
-
-    signal = "BUY" if proba >= 0.65 else "WATCH" if proba >= 0.50 else "PASS"
-    confidence = "HIGH" if proba >= 0.65 else "MEDIUM" if proba >= 0.55 else "LOW"
-
-    return PredictionResponse(
-        ticker=ticker.upper(),
-        probability=round(proba, 4),
-        signal=signal,
-        confidence=confidence
-    )
+        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "ticker":      ticker.upper(),
+        "probability": round(proba, 4),
+        "signal":      "BUY" if proba >= 0.55 else "WATCH" if proba >= 0.45 else "PASS",
+        "confidence":  "HIGH" if proba >= 0.65 else "MEDIUM" if proba >= 0.55 else "LOW"
+    }
 
 @app.post("/predict-batch")
 def predict_batch(items: list[dict]):
-    """Predict for multiple stocks at once"""
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-
-    feature_cols = [
-        'rsi14', 'sma20', 'sma50', 'sma200', 'bb_pos',
-        'vol_ratio', 'roc5', 'roc20',
-        'pct_from_sma20', 'pct_from_sma200',
-        'above_sma20', 'above_sma200', 'golden_cross',
-        'hammer', 'bull_candle', 'lower_shadow', 'upper_shadow',
-        'body', 'range'
-    ]
-
-    results = []
-    tickers = [item.get('ticker', 'UNKNOWN') for item in items]
-    X = np.array([[item.get(f, 0.0) for f in feature_cols] for item in items])
-
+    X = np.array([[item.get(f, 0.0) for f in FEATURE_COLS] for item in items])
     try:
         probas = model.predict_proba(X)[:, 1]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Batch prediction error: {e}")
-
-    for ticker, proba in zip(tickers, probas):
-        proba = float(proba)
-        results.append({
-            "ticker":      ticker.upper(),
-            "probability": round(proba, 4),
-            "signal":      "BUY" if proba >= 0.65 else "WATCH" if proba >= 0.50 else "PASS",
-            "confidence":  "HIGH" if proba >= 0.65 else "MEDIUM" if proba >= 0.55 else "LOW"
-        })
-
-    return results
+        raise HTTPException(status_code=500, detail=str(e))
+    return [{"ticker": item.get('ticker','').upper(), "probability": round(float(p),4),
+             "signal": "BUY" if p>=0.55 else "WATCH" if p>=0.45 else "PASS",
+             "confidence": "HIGH" if p>=0.65 else "MEDIUM" if p>=0.55 else "LOW"}
+            for item, p in zip(items, probas)]
 
 if __name__ == "__main__":
     import uvicorn
